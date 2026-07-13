@@ -27,6 +27,13 @@ struct DeployedContracts {
     address emergencyUpgradeBoard;
 }
 
+// The EmergencyUpgradeBoard deployed before the guardians removal exposes a `GUARDIANS()`
+// getter that no longer exists on the current EmergencyUpgradeBoard sources. This script
+// reads from the previous-generation deployment, so it needs the legacy interface.
+interface ILegacyEmergencyUpgradeBoard {
+    function GUARDIANS() external view returns (address);
+}
+
 // A common redeploy script that can be used for both mainnet and testnet scripts
 contract Redeploy is Script {
     ICREATE3Factory CREATE3_FACTORY = ICREATE3Factory(vm.envAddress("CREATE3_FACTORY"));
@@ -93,7 +100,7 @@ contract Redeploy is Script {
 
         // A small cross check for consistency
         require(emergencyUpgradeBoard.SECURITY_COUNCIL() == securityCouncil, "incorrect security council");
-        require(emergencyUpgradeBoard.GUARDIANS() == guardians, "incorrect guardians");
+        require(ILegacyEmergencyUpgradeBoard(address(emergencyUpgradeBoard)).GUARDIANS() == guardians, "incorrect guardians");
         require(emergencyUpgradeBoard.PROTOCOL_UPGRADE_HANDLER() == IProtocolUpgradeHandler(address(_currentProtocolUpgradeHandler)), "incorrect protocol upgrade handler");
 
         return CurrentSystemParams({
@@ -186,7 +193,7 @@ contract Redeploy is Script {
 
         // Deploying emergency upgrade board
         {
-            bytes memory emergencyUpgradeBoardConstructorArgs = abi.encode(addresses.protocolUpgradeHandlerProxy, addresses.securityCouncil, addresses.guardians, info.zkFoundationSafe);
+            bytes memory emergencyUpgradeBoardConstructorArgs = abi.encode(addresses.protocolUpgradeHandlerProxy, addresses.securityCouncil, info.zkFoundationSafe);
             bytes memory emergencyUpgradeBoardCreationCode = abi.encodePacked(type(EmergencyUpgradeBoard).creationCode, emergencyUpgradeBoardConstructorArgs);
             
             vm.startBroadcast(deployerWallet.addr);
