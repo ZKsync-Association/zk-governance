@@ -1,0 +1,135 @@
+import { config as dotEnvConfig } from "dotenv";
+import { Deployer } from "@matterlabs/hardhat-zksync-deploy";
+import { Contract, Wallet } from "zksync-ethers";
+import { keccak256, toUtf8Bytes } from "ethers";
+import * as hre from "hardhat";
+
+// Redeploys the ZkGovOpsGovernor as part of the guardians removal: the new instance keeps
+// the live settings, token and TimelockController of the current governor, but swaps the
+// immutable veto seat:
+//   - VETO_GUARDIAN -> the ZK Foundation Safe on Era (NEW_VETO_GUARDIAN)
+//
+// The script does NOT touch the timelock: it prints the proposal actions that must be
+// passed through the *current* governor to hand the timelock roles over to the new one.
+//
+// Required env vars:
+//   DEPLOYER_PRIVATE_KEY - deployer key
+//   CURRENT_GOVERNOR     - address of the live ZkGovOpsGovernor
+//   NEW_VETO_GUARDIAN    - ZK Foundation Safe (Era) taking the veto seat
+const contractName = "ZkGovOpsGovernor";
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw `Please set ${name} in your .env file`;
+  }
+  return value;
+}
+
+async function main() {
+  dotEnvConfig();
+
+  const deployerPrivateKey = requireEnv("DEPLOYER_PRIVATE_KEY");
+  const currentGovernorAddress = requireEnv("CURRENT_GOVERNOR");
+  const newVetoGuardian = requireEnv("NEW_VETO_GUARDIAN");
+
+  const zkWallet = new Wallet(deployerPrivateKey);
+  const deployer = new Deployer(hre, zkWallet);
+
+  const governorArtifact = await deployer.loadArtifact(contractName);
+  const currentGovernor = new Contract(currentGovernorAddress, governorArtifact.abi, deployer.zkWallet);
+
+  // Read the live configuration from the current governor.
+  const name = await currentGovernor.name();
+  const tokenAddress = await currentGovernor.token();
+  const timelockAddress = await currentGovernor.timelock();
+  const votingDelay = await currentGovernor.votingDelay();
+  const votingPeriod = await currentGovernor.votingPeriod();
+  const proposalThreshold = await currentGovernor.proposalThreshold();
+  const quorum = await currentGovernor.quorum(await currentGovernor.clock());
+  const lateQuorumVoteExtension = await currentGovernor.lateQuorumVoteExtension();
+  const oldVetoGuardian = await currentGovernor.VETO_GUARDIAN();
+
+  console.log("=== Current ZkGovOpsGovernor ===");
+  console.log(`Address: ${currentGovernorAddress}`);
+  console.log(`Name: ${name}`);
+  console.log(`Token: ${tokenAddress}`);
+  console.log(`Timelock: ${timelockAddress}`);
+  console.log(`Voting delay: ${votingDelay}`);
+  console.log(`Voting period: ${votingPeriod}`);
+  console.log(`Proposal threshold: ${proposalThreshold}`);
+  console.log(`Quorum: ${quorum}`);
+  console.log(`Late quorum vote extension: ${lateQuorumVoteExtension}`);
+  console.log(`Old VETO_GUARDIAN: ${oldVetoGuardian}`);
+  console.log("");
+  console.log(`New VETO_GUARDIAN (ZK Foundation Safe): ${newVetoGuardian}`);
+
+  console.log("");
+  console.log(`Deploying the new ${contractName}...`);
+
+  const argStruct = {
+    name: name,
+    token: tokenAddress,
+    timelock: timelockAddress,
+    initialVotingDelay: votingDelay,
+    initialVotingPeriod: votingPeriod,
+    initialProposalThreshold: proposalThreshold,
+    initialQuorum: quorum,
+    initialVoteExtension: lateQuorumVoteExtension,
+    vetoGuardian: newVetoGuardian,
+  };
+  const constructorArgs = [argStruct];
+  const newGovernor = await deployer.deploy(governorArtifact, constructorArgs);
+  const newGovernorAddress = await newGovernor.getAddress();
+
+  console.log(`${contractName} was deployed to ${newGovernorAddress}`);
+  console.log("constructor args:" + newGovernor.interface.encodeDeploy(constructorArgs));
+
+  // Build the timelock role migration that must be proposed on the CURRENT governor.
+  const timelockArtifact = await deployer.loadArtifact("TimelockController");
+  const timelock = new Contract(timelockAddress, timelockArtifact.abi, deployer.zkWallet);
+  const proposerRole = await timelock.PROPOSER_ROLE();
+  const cancellerRole = await timelock.CANCELLER_ROLE();
+  const executorRole = await timelock.EXECUTOR_ROLE();
+
+  // Grants first, revokes second: if execution were ever partial the timelock is never
+  // left without a governor holding the roles.
+  const calldatas = [
+    timelock.interface.encodeFunctionData("grantRole", [proposerRole, newGovernorAddress]),
+    timelock.interface.encodeFunctionData("grantRole", [cancellerRole, newGovernorAddress]),
+    timelock.interface.encodeFunctionData("grantRole", [executorRole, newGovernorAddress]),
+    timelock.interface.encodeFunctionData("revokeRole", [proposerRole, currentGovernorAddress]),
+    timelock.interface.encodeFunctionData("revokeRole", [cancellerRole, currentGovernorAddress]),
+    timelock.interface.encodeFunctionData("revokeRole", [executorRole, currentGovernorAddress]),
+  ];
+  const targets = calldatas.map(() => timelockAddress);
+  const values = calldatas.map(() => 0n);
+  const description =
+    `Migrate ${contractName} timelock roles to the redeployed governor at ${newGovernorAddress} ` +
+    "(guardians removal: veto seat moves to the ZK Foundation Safe)";
+
+  console.log("");
+  console.log("=== Timelock role migration (propose on the CURRENT governor) ===");
+  console.log(
+    JSON.stringify(
+      {
+        targets: targets,
+        values: values.map((v) => v.toString()),
+        calldatas: calldatas,
+        description: description,
+      },
+      null,
+      2
+    )
+  );
+  console.log(`Description hash: ${keccak256(toUtf8Bytes(description))}`);
+  console.log(
+    "propose() calldata: " +
+      currentGovernor.interface.encodeFunctionData("propose", [targets, values, calldatas, description])
+  );
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

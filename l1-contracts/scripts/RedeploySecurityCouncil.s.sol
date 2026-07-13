@@ -112,7 +112,6 @@ contract RedeploySecurityCouncil is Script {
         EmergencyUpgradeBoard newEmergencyUpgradeBoard = new EmergencyUpgradeBoard(
             IProtocolUpgradeHandler(_currentHandler),
             address(newSecurityCouncil),
-            currentGuardians,
             zkFoundationSafe
         );
         vm.stopBroadcast();
